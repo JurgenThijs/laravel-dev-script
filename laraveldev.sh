@@ -13,7 +13,7 @@
 # Prerequisites
 # ===============
 # composer installed globally => https://getcomposer.org/download/
-# yarn => https://yarnpkg.com/getting-started/install
+# NodeJS => https://nodejs.org/en/
 # httpd (Apache) => https://httpd.apache.org
 # certbot => https://certbot.eff.org
 # git => https://git-scm.com/doc
@@ -26,9 +26,9 @@
 
 CODE_FOLDER=~/code
 DEFAULT_DOMAIN='jt-productions.be'
-TIMEZONE=Europe/Brussels
-LANGUAGE=nl
-FAKER_LOCALE=nl_BE
+TIMEZONE='Europe\/Brussels'
+LANGUAGE='nl'
+FAKER_LOCALE='nl_BE'
 
 ########################################################
 #                                                      #
@@ -66,9 +66,9 @@ sed -i 's/ -->//' phpunit.xml
 
 # Change some settings in config/app.php
 echo "app.php"
-sed -i "s/'timezone' => 'UTC'/'timezone' => \'${TIMEZONE}\'/" config/app.php
-sed -i "s/'locale' => 'en'/'locale' => \'${LANGUAGE}\'/" config/app.php
-sed -i "s/'faker_locale' => 'en_US'/'faker_locale' => \'${FAKER_LOCALE}\'/" config/app.php
+sed -i "s/'timezone' => 'UTC'/'timezone' => '${TIMEZONE}'/" config/app.php
+sed -i "s/'locale' => 'en'/'locale' => '${LANGUAGE}'/" config/app.php
+sed -i "s/'faker_locale' => 'en_US'/'faker_locale' => '${FAKER_LOCALE}'/" config/app.php
 sed -i 's/QUEUE_CONNECTION=sync/QUEUE_CONNECTION=database/' .env
 
 # Create migrations
@@ -144,12 +144,207 @@ php artisan -q migrate
 echo ""
 echo "Installing Nodejs"
 echo "================="
-yarn
+npm install && npm run dev
+
+echo "Setting premissions"
+sudo chmod -R 777 storage
+sudo chmod -R 777 bootstrap/cache
 
 # Create a default git repo
 echo ""
 echo "Git"
 echo "==="
+echo "Create Github actions"
+mkdir -p .github/workflows/
+touch .github/workflows/run-tests.yml
+cat <<EOT >> .github/workflows/run-tests.yml
+name: Tests
+
+on: [ push ]
+
+jobs:
+  tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+
+      - name: Cache composer dependencies
+        uses: actions/cache@v1
+        with:
+          path: vendor
+          key: composer-\${{ hashFiles('composer.lock') }}
+
+      - name: Run composer install
+        run: composer install -n --prefer-dist
+        env:
+          APP_ENV: testing
+
+      - name: Prepare Laravel Application
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Run npm
+        run: npm install && npm run dev
+
+      - name: Run tests
+        run: ./vendor/bin/phpunit
+        env:
+          APP_ENV: testing
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@master
+        if: failure()
+        with:
+          name: Logs
+          path: ./storage/logs
+EOT
+
+echo "Create Gitlab CI"
+cp .env.example .env.example.gitlab
+sed -i "s/DB_USERNAME=root/DB_USERNAME='ohdear_ci'" .env.example.gitlab
+sed -i "s/DB_PASSWORD=/DB_PASSWORD='ohdear_secret'/" .env.example.gitlab
+sed -i "s/DB_DATABASE=${PROJECT_NAME}/DB_DATABASE='ohdear_ci'/" .env.example.gitlab
+
+touch .gitlab-ci.yml
+cat <<EOT >> .gitlab-ci.yml
+stages:
+  - preparation
+  - building
+  - testing
+  - security
+
+image: edbizarro/gitlab-ci-pipeline-php:7.4-alpine
+
+variables:
+  MYSQL_ROOT_PASSWORD: root
+  MYSQL_USER: ohdear_ci
+  MYSQL_PASSWORD: ohdear_secret
+  MYSQL_DATABASE: ohdear_ci
+  DB_HOST: mysql
+
+composer:
+  stage: preparation
+  script:
+    - php -v
+    - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+    - cp .env.example.gitlab .env
+    - php artisan key:generate
+  artifacts:
+    paths:
+      - vendor/
+      - .env
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - vendor/
+
+yarn:
+  stage: preparation
+  script:
+    - yarn --version
+    - yarn install --pure-lockfile
+  artifacts:
+    paths:
+      - node_modules
+    expire_in: 1 days
+    when: always
+  cache:
+    paths:
+      - node_modules
+
+build-assets:
+  stage: building
+  dependencies:
+    - composer
+    - yarn
+  script:
+    - yarn --version
+    - yarn run production --progress false
+  artifacts:
+    paths:
+      - public/css
+      - public/js
+      - public/fonts
+      - public/mix-manifest.json
+    expire_in: 1 days
+    when: always
+
+db-seeding:
+  stage: building
+  services:
+    - name: mysql:8.0
+      command: [ "--default-authentication-plugin=mysql_native_password" ]
+  dependencies:
+    - composer
+    - yarn
+  script:
+    - mysql --version
+    - php artisan migrate:fresh --seed
+    - mysqldump --host="\${DB_HOST}" --user="\${MYSQL_USER}" --password="\${MYSQL_PASSWORD}" "\${MYSQL_DATABASE}" > db.sql
+  artifacts:
+    paths:
+      - storage/logs # for debugging
+      - db.sql
+    expire_in: 1 days
+    when: always
+
+phpunit:
+  stage: testing
+  services:
+    - name: mysql:8.0
+      command: [ "--default-authentication-plugin=mysql_native_password" ]
+
+  dependencies:
+    - build-assets
+    - composer
+    - db-seeding
+  script:
+    - php -v
+    - sudo cp /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini /usr/local/etc/php/conf.d/docker-php-ext-xdebug.bak
+    - echo "" | sudo tee /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+    - mysql --host="\${DB_HOST}" --user="\${MYSQL_USER}" --password="\${MYSQL_PASSWORD}" "\${MYSQL_DATABASE}" < db.sql
+    - ./vendor/phpunit/phpunit/phpunit --version
+    - php -d short_open_tag=off ./vendor/phpunit/phpunit/phpunit -v --coverage-text --stderr
+    - sudo cp /usr/local/etc/php/conf.d/docker-php-ext-xdebug.bak /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+  artifacts:
+    paths:
+      - ./storage/logs # for debugging
+    expire_in: 1 days
+    when: on_failure
+
+codestyle:
+  stage: testing
+  image: lorisleiva/laravel-docker
+  script:
+    - phpcs --standard=PSR2 --extensions=php app
+  dependencies: [ ]
+
+phpcpd:
+  stage: testing
+  script:
+    - test -f phpcpd.phar || curl -L https://phar.phpunit.de/phpcpd.phar -o phpcpd.phar
+    - php phpcpd.phar app/ --min-lines=50
+  dependencies: [ ]
+  cache:
+    paths:
+      - phpcpd.phar
+
+sensiolabs:
+  stage: security
+  script:
+    - test -d security-checker || git clone https://github.com/sensiolabs/security-checker.git
+    - cd security-checker
+    - composer install
+    - php security-checker security:check ../composer.lock
+  dependencies: [ ]
+  cache:
+    paths:
+      - security-checker/
+EOT
+
 echo "Initialize Git"
 git init -q
 echo "Add whole project to staging"
