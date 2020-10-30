@@ -365,9 +365,6 @@ if [[ $FQDN == "" ]]; then
     FQDN="$FQN"
 fi
 
-sudo chmod -R 777 storage
-sudo chmod -R 777 bootstrap/cache
-
 echo "Creating apache conf file for http://${FQDN}"
 sudo rm -rf /etc/httpd/conf.d/${PROJECT_NAME}*.conf
 cat <<EOT >> ${PROJECT_NAME}_dev.conf
